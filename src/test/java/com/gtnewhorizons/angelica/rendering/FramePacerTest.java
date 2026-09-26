@@ -34,8 +34,7 @@ class FramePacerTest {
         int parkCalls;
         int pumpCalls;
         boolean awaitedBeforeRead;
-        boolean readBeforePump;
-        boolean parkedBeforePump;
+        final StringBuilder trace = new StringBuilder();
 
         @Override
         public VSyncMode effectiveVSyncMode() {
@@ -57,15 +56,21 @@ class FramePacerTest {
             return displayGeneration;
         }
 
+        void noteRenderAheadWait() {
+            mark("wait");
+        }
+
         @Override
         public void awaitPresent() {
             awaitPresentCalls++;
+            mark("await");
         }
 
         @Override
         public void readGateSample(GateSample out) {
             readGateSampleCalls++;
             awaitedBeforeRead = awaitPresentCalls > 0;
+            mark("read");
             out.durationNanos = gateDurationNanos;
             out.endNanos = gateEndNanos;
             out.gpuWaitNanos = gpuWaitNanos;
@@ -74,14 +79,19 @@ class FramePacerTest {
         @Override
         public void pumpDisplayMessages() {
             pumpCalls++;
-            readBeforePump = readGateSampleCalls > 0;
-            parkedBeforePump = parkCalls > 0;
+            mark("pump");
         }
 
         @Override
         public void parkNanos(long nanos) {
             parkCalls++;
             now += nanos;
+            mark("park");
+        }
+
+        private void mark(String event) {
+            if (trace.length() > 0) trace.append(',');
+            trace.append(event);
         }
 
         @Override
@@ -118,6 +128,32 @@ class FramePacerTest {
         } finally {
             Reflect.setStatic(FramePacer.class, "BACKEND", original);
         }
+    }
+
+    private static void assertBoundaryPumpOrder(String trace, boolean awaitPresent, boolean laterFrameSleeps) {
+        final String[] events = trace.isEmpty() ? new String[0] : trace.split(",");
+        int index = 0;
+        for (int frame = 0; frame < 2; frame++) {
+            if (awaitPresent) {
+                assertEquals("await", nextEvent(events, index++, trace), trace);
+            }
+            assertEquals("read", nextEvent(events, index++, trace), "the gate sample must be read before the window is pumped: " + trace);
+            assertEquals("wait", nextEvent(events, index++, trace), "the render-ahead wait finishes before the pump: " + trace);
+            if (frame > 0 && laterFrameSleeps) {
+                assertEquals("park", nextEvent(events, index++, trace), "the pump must follow the pacing sleep, not precede it: " + trace);
+                while (index < events.length && "park".equals(events[index])) index++;
+            }
+            final String pumpMessage = frame > 0 && laterFrameSleeps
+                ? "one boundary pump per endFrame: " + trace
+                : "the frame pumps after the gate read and render-ahead wait, without a pacing sleep: " + trace;
+            assertEquals("pump", nextEvent(events, index++, trace), pumpMessage);
+        }
+        assertEquals(index, events.length, trace);
+    }
+
+    private static String nextEvent(String[] events, int index, String trace) {
+        assertTrue(index < events.length, trace);
+        return events[index];
     }
 
     @ParameterizedTest(name = "{0} refresh={1} cap={2}->{3} locked={4} probing={5}")
@@ -189,18 +225,26 @@ class FramePacerTest {
         });
     }
 
-    @Test
-    void endFramePumpsExactlyOnceAfterTheGateReadAndThePacingSleep() {
+    @ParameterizedTest(name = "{0} cap={1}")
+    @CsvSource({
+        "ON, 0",
+        "ON, 60",
+        "MAILBOX, 0",
+        "MAILBOX, 60",
+        "OFF, 60",
+        "OFF, 0",
+    })
+    void endFramePumpsExactlyOnceAfterTheGateReadAndThePacingSleep(VSyncMode mode, int capHz) {
         final FakeBackend backend = new FakeBackend();
-        backend.mode = VSyncMode.OFF;
+        backend.mode = mode;
+        backend.vsyncHonored = true;
+        if (mode.tearFree()) backend.refreshPeriodNanos = 16_666_666L;
         withBackend(backend, () -> {
-            FramePacer.endFrame(60, null);
-            assertEquals(1, backend.pumpCalls);
-            assertTrue(backend.readBeforePump, "the gate sample must be read before the window is pumped");
-
-            FramePacer.endFrame(60, null);
-            assertEquals(2, backend.pumpCalls);
-            assertTrue(backend.parkedBeforePump, "the pump must follow the pacing sleep, not precede it");
+            for (int frame = 1; frame <= 2; frame++) {
+                FramePacer.endFrame(capHz, backend::noteRenderAheadWait);
+                assertEquals(frame, backend.pumpCalls, "one boundary pump per endFrame");
+            }
+            assertBoundaryPumpOrder(backend.trace.toString(), mode == VSyncMode.ON, capHz > 0 || mode.tearFree());
         });
     }
 
